@@ -124,6 +124,58 @@ class ScoreNet(nn.Module):
 
 
 
+
+class ScoreNet3(nn.Module):
+    '''3 layer (two hidden) neural network approximating the score
+    s(t, theta, x).
+
+    Inputs: x concatenated with t -> dimension D_0 = d + 1
+    Hidden layer 1: D_1 units, tanh activation
+    Hidden layer 2: D_2 units, tanh activation  
+    Output: dimension D_3 = d (the score vector), identity activation
+    '''
+
+    def __init__(self, d, D_1, D_2):
+        super().__init__()
+
+        D_0 = d + 1   # input dimension: d spatial + 1 time
+        D_3 = d       # output dimension matches data dimension
+
+        self.layer1 = nn.Linear(D_0, D_1)
+        self.layer2 = nn.Linear(D_1, D_2)
+        self.layer3 = nn.Linear(D_2, D_3)
+
+        # phi_1 = phi_2 = tanh, phi_3 = identity
+        self.phi_1 = nn.Tanh()
+        self.phi_2 = nn.Tanh()
+
+    def forward(self, x, t):
+        '''
+        x: tensor of shape (batch_size, d)
+        t: tensor of shape (batch_size, 1)
+        returns: tensor of shape (batch_size, d), the score estimate
+        '''
+
+        # Layer 0: input
+        z_0 = torch.cat([x, t], dim=1)          # (batch_size, D_0)
+
+        # Layer 1: pre-activation and activation
+        a_1 = self.layer1(z_0)                   # (batch_size, D_1)
+        z_1 = self.phi_1(a_1)                    # (batch_size, D_1)
+
+        # Layer 2: pre-activation and activation
+        a_2 = self.layer2(z_1)                   # (batch_size, D_2)
+        z_2 = self.phi_2(a_2)                    # (batch_size, D_2)
+
+        # Layer 3: output, phi_3 = id
+        a_3 = self.layer3(z_2)                   # (batch_size, D_3)
+        z_3 = a_3                                # identity output activation
+
+        return z_3
+    
+
+    
+
 # Functions from the understanding notebook.
 
 
