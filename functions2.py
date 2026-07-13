@@ -9,70 +9,26 @@ import ot
 
 
 # ------------------------------------------------------------
-# Device / reproducibility helpers
+# Device / reproducibility / save-load helpers
 # ------------------------------------------------------------
 
 def get_device():
     return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
+
 def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
+
 
 def save_results(results, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(results, path)
     print(f"Saved results to {path}")
 
+
 def load_results(path):
-    return torch.load(path)
-
-
-# ------------------------------------------------------------
-# SGLD (motivating example)
-# ------------------------------------------------------------
-
-def H_func(theta, X):
-    '''
-    Computes the stochastic gradient. takes in current theta and unpacks X.
-    equation (14)
-    '''
-    tau, X_0, z = X
-
-    m_tau = np.exp(-tau)
-    sigma2_tau = 1 - np.exp(-2 * tau)
-    sigma_tau = np.sqrt(sigma2_tau)
-
-    return 2 * sigma2_tau * m_tau * ((1/sigma_tau) * z - m_tau * X_0 - sigma_tau * z + m_tau * theta)
-
-
-def theta_nplusone_func(lambda_, beta, theta_n, X):
-    '''
-    Computes the new theta value using the recurrence relation given by (15)
-    '''
-    return theta_n - lambda_ * H_func(theta=theta_n, X=X) + (np.sqrt(2 * lambda_ / beta) * np.random.normal(0, 1, len(theta_n)))
-
-
-def thetahat_func(X_data, beta, lambda_, theta_0, N_sgld, t_0, T):
-    '''
-    SGLD for theta_hat which is a d dimensional vector approximating the means.
-    '''
-    theta = theta_0
-    theta_tracker = [theta_0]
-
-    N = X_data.shape[0]
-    d = X_data.shape[1]
-
-    for i in range(N_sgld):
-        tau = np.random.uniform(t_0, T)
-        x0_n = X_data[np.random.randint(N)]
-        z_n = np.random.normal(0, 1, d)
-        X_n = (tau, x0_n, z_n)
-
-        theta = theta_nplusone_func(lambda_=lambda_, beta=beta, theta_n=theta, X=X_n)
-        theta_tracker.append(theta)
-
-    return theta, theta_tracker
+    return torch.load(path, weights_only=False)
 
 
 # ------------------------------------------------------------
@@ -96,8 +52,7 @@ class ScoreNet(nn.Module):
         a_1 = self.layer1(z_0)
         z_1 = self.phi_1(a_1)
         a_2 = self.layer2(z_1)
-        z_2 = a_2
-        return z_2
+        return a_2
 
 
 class ScoreNet3(nn.Module):
@@ -122,38 +77,20 @@ class ScoreNet3(nn.Module):
         a_2 = self.layer2(z_1)
         z_2 = self.phi_2(a_2)
         a_3 = self.layer3(z_2)
-        z_3 = a_3
-        return z_3
-
-
-# ------------------------------------------------------------
-# Analytic-score reverse SDE (motivating example)
-# ------------------------------------------------------------
-
-def euler_maruyama_approximation(Y_k, theta_hat, k, gamma, T):
-    d = Y_k.shape[0]
-    s = -Y_k + np.exp(-(T - (k * gamma))) * theta_hat
-    increment = gamma * (Y_k + 2 * s)
-    noise = np.sqrt(2 * gamma) * np.random.normal(0, 1, d)
-    k += 1
-    return Y_k + increment + noise, k
-
-
-def euler_maruyama_sample(theta_hat, gamma, T, d):
-    K_plus_1 = int(round(T / gamma))
-    Y_k = np.random.normal(0, 1, d)
-    trajectory = [Y_k]
-
-    for k in range(K_plus_1):
-        Y_k, _ = euler_maruyama_approximation(Y_k, theta_hat, k, gamma, T)
-        trajectory.append(Y_k)
-
-    return Y_k, trajectory
+        return a_3
 
 
 # ------------------------------------------------------------
 # Training data + batch sampling
 # ------------------------------------------------------------
+
+def sample_bimodal_data(N, d, mu1, mu2, sigma=1.0, weight=0.5):
+    component = np.random.uniform(size=N) < weight
+    X = np.zeros((N, d))
+    X[component] = np.random.normal(mu1, sigma, size=(component.sum(), d))
+    X[~component] = np.random.normal(mu2, sigma, size=((~component).sum(), d))
+    return X
+
 
 def sample_training_batch(X_data, t_0, T, d, batch_size):
     N = X_data.shape[0]
@@ -172,45 +109,9 @@ def sample_training_batch(X_data, t_0, T, d, batch_size):
     return tau, x_t, g
 
 
-def sample_bimodal_data(N, d, mu1, mu2, sigma=1.0, weight=0.5):
-    component = np.random.uniform(size=N) < weight
-    X = np.zeros((N, d))
-    X[component] = np.random.normal(mu1, sigma, size=(component.sum(), d))
-    X[~component] = np.random.normal(mu2, sigma, size=((~component).sum(), d))
-    return X
-
-
 # ------------------------------------------------------------
-# Training loop (single network)
+# Sampling from a trained network (reverse SDE, Euler-Maruyama)
 # ------------------------------------------------------------
-
-def train_score_net(net, X_data, t_0, T, d, n_iters=5000, batch_size=256,
-                     lr=1e-3, print_every=500, device="cpu"):
-
-    net.to(device)
-    optimizer = torch.optim.Adam(net.parameters(), lr=lr)
-    loss_fn = nn.MSELoss()
-
-    net.train()
-    for it in range(n_iters):
-        tau_b, x_t_b, g_b = sample_training_batch(X_data, t_0, T, d, batch_size)
-
-        tau_t = torch.tensor(tau_b, dtype=torch.float32, device=device)
-        x_t_t = torch.tensor(x_t_b, dtype=torch.float32, device=device)
-        g_t = torch.tensor(g_b, dtype=torch.float32, device=device)
-
-        s_pred = net(x_t_t, tau_t)
-        loss = loss_fn(s_pred, g_t)
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        if it % print_every == 0:
-            print(f"iter {it}, loss = {loss.item():.4f}")
-
-    return net
-
 
 def euler_maruyama_sample_nn_batch(net, gamma, T, d, N_samples, device="cpu"):
     K_plus_1 = int(round(T / gamma))
@@ -249,20 +150,7 @@ def estimate_W2(net, samples_true, N_w2, n_repeats, gamma, T, d, device):
             net, gamma=gamma, T=T, d=d, N_samples=N_w2, device=device
         )
         M = ot.dist(samples, samples_true, metric='sqeuclidean')
-        W2_vals.append(np.sqrt(ot.emd2(a, b, M, numItermax=1000000)))
-    return np.mean(W2_vals), np.std(W2_vals)
-
-
-def W2_self_floor(X_data, N, n_repeats=5):
-    W2_vals = []
-    a = np.ones(N) / N
-    b = np.ones(N) / N
-    for _ in range(n_repeats):
-        idx = np.random.permutation(len(X_data))
-        s1 = X_data[idx[:N]]
-        s2 = X_data[idx[N:2 * N]]
-        M = ot.dist(s1, s2, metric='sqeuclidean')
-        W2_vals.append(np.sqrt(ot.emd2(a, b, M, numItermax=10_000_000)))
+        W2_vals.append(np.sqrt(ot.emd2(a, b, M, numItermax=1_000_000)))
     return np.mean(W2_vals), np.std(W2_vals)
 
 
@@ -334,11 +222,11 @@ def run_W2_experiment(X_data, checkpoints, d, device,
             W2_3layer_std.append(w2_std3)
             net3.train()
 
-            print(f"  W2 2-layer: {w2_mean:.4f} \u00b1 {w2_std:.4f}"
-                  f" | W2 3-layer: {w2_mean3:.4f} \u00b1 {w2_std3:.4f}")
+            print(f"  W2 2-layer: {w2_mean:.4f} +/- {w2_std:.4f}"
+                  f" | W2 3-layer: {w2_mean3:.4f} +/- {w2_std3:.4f}")
 
             results = {
-                "checkpoints_done": [c for c in checkpoints if c <= it],
+                "checkpoints": [c for c in checkpoints if c <= it],
                 "W2_2layer_curve": W2_2layer_curve,
                 "W2_2layer_std": W2_2layer_std,
                 "W2_3layer_curve": W2_3layer_curve,
@@ -352,15 +240,7 @@ def run_W2_experiment(X_data, checkpoints, d, device,
             if save_path is not None:
                 save_results(results, save_path)
 
-    return {
-        "checkpoints": checkpoints,
-        "W2_2layer_curve": W2_2layer_curve,
-        "W2_2layer_std": W2_2layer_std,
-        "W2_3layer_curve": W2_3layer_curve,
-        "W2_3layer_std": W2_3layer_std,
-        "net": net,
-        "net3": net3,
-    }
+    return results
 
 
 def plot_W2_curve(results, title_suffix=""):
