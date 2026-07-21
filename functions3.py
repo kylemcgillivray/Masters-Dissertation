@@ -455,3 +455,87 @@ def run_W2_experiment(X_data, checkpoints, d, device,
                 save_results(results, save_path)
 
     return results
+
+
+
+########################################################################################################################
+############################################## TUSLA. #########################################################
+########################################################################################################################
+
+def train_network_tusla(net, X_data, t_0, T, d, n_iters, batch_size,
+                         lam, beta, eta, r, device, kappa_fn=None, print_every=500):
+    """
+    Train via TUSLA (Lovas, Lytras, Rasonyi, Sabanis 2020), designed specifically
+    for the case where the network's stochastic gradient H(theta,x) is only
+    LOCALLY Lipschitz in theta, with a "constant" growing polynomially in
+    ||theta|| - exactly the gap flagged relative to Assumption 3.a, which
+    requires a theta-independent Lipschitz constant.
+
+    Two ingredients added on top of plain SGLD:
+      1. Regularisation: add eta * theta * |theta|^(2r) to the raw gradient,
+         creating a restoring force for large ||theta||.
+      2. Taming: divide the regularised gradient by (1 + sqrt(lam)*|theta|^(2r)),
+         where |theta| is the norm of the FULL flattened parameter vector
+         (not per-tensor). This caps the effective step size regardless of
+         how large the raw gradient becomes, preventing destabilising
+         overshoot events - directly targeting the spikes seen with plain SGLD.
+
+    r should satisfy r >= q/2 + 1 where q-1 = 2n+1 for an n-hidden-layer
+    network with a bounded, Lipschitz-derivative activation (tanh qualifies).
+    For a 1-hidden-layer ScoreNet, this gives q=4, so r=3 is a reasonable
+    starting point - still treat r, eta, lam as tunable hyperparameters.
+
+    Returns (net, loss_history, param_norm_history) - the parameter norm
+    trace lets you directly check whether taming is keeping ||theta||
+    bounded, the mechanism TUSLA relies on for stability.
+    """
+    net.to(device)
+    loss_history = []
+    param_norm_history = []
+
+    net.train()
+    for it in range(1, n_iters + 1):
+        tau_b, x_t_b, g_b = sample_training_batch(X_data, t_0, T, d, batch_size)
+
+        tau_t = torch.tensor(tau_b, dtype=torch.float32, device=device)
+        x_t_t = torch.tensor(x_t_b, dtype=torch.float32, device=device)
+        g_t = torch.tensor(g_b, dtype=torch.float32, device=device)
+
+        pred = net(x_t_t, tau_t)
+        per_sample_sq_error = ((pred - g_t) ** 2).sum(dim=1)
+
+        if kappa_fn is not None:
+            kappa_t = torch.tensor(kappa_fn(tau_b), dtype=torch.float32, device=device).squeeze(-1)
+            per_sample_sq_error = kappa_t * per_sample_sq_error
+
+        loss = per_sample_sq_error.mean()
+
+        net.zero_grad()
+        loss.backward()
+
+        with torch.no_grad():
+            # Full parameter-vector norm across ALL tensors - taming is defined
+            # relative to the FULL theta, not per-tensor.
+            theta_norm_sq = sum((p ** 2).sum() for p in net.parameters())
+            theta_norm = torch.sqrt(theta_norm_sq)
+
+            taming_denom = 1 + np.sqrt(lam) * (theta_norm ** (2 * r))
+
+            for p in net.parameters():
+                # H(theta,x) = G(theta,x) + eta * theta * |theta|^(2r)
+                regularised_grad = p.grad + eta * p * (theta_norm ** (2 * r))
+                # H_lambda(theta,x) = H(theta,x) / (1 + sqrt(lambda)|theta|^(2r))
+                tamed_grad = regularised_grad / taming_denom
+
+                noise = torch.randn_like(p) * np.sqrt(2 * lam / beta)
+                p.add_(-lam * tamed_grad + noise)
+
+            param_norm_history.append(theta_norm.item())
+
+        loss_history.append(loss.item())
+
+        if it % print_every == 0:
+            print(f"[TUSLA] iter {it}/{n_iters}, loss = {loss.item():.4f}, "
+                  f"||theta|| = {theta_norm.item():.4f}")
+
+    return net, loss_history, param_norm_history
