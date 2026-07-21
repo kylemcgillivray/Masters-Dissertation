@@ -1,13 +1,10 @@
 """
 functions3.py
 
-Core machinery for training and sampling from neural-network score
-estimators, following the framework in Sabanis (2023, 2025) and Song
-et al. (2021).
+for training and sampling from neural-network score
+estimators, following the framework in Sabanis (2023, 2025)
 
-This module intentionally contains NO plotting code. All plotting and
-function-calling for exploration lives in the notebook - this file is
-just the reusable machinery: networks, data generation, training loops
+this file is just the reusable machinery: networks, data generation, training loops
 (Adam and SGLD variants), the reverse-SDE sampler, and the W2 metric.
 """
 
@@ -130,7 +127,7 @@ def sample_bimodal_data(N, d, mu1, mu2, sigma=1.0, weight=0.5):
 def sample_training_batch(X_data, t_0, T, d, batch_size):
     """
     Draw one minibatch of training triples (tau, x_t, g) for denoising
-    score matching, per the tractable objective in \eqref{eq:loss_expectation}:
+    score matching, per the tractable objective
 
         tau  ~ Uniform([t_0, T])
         x_0  ~ empirical distribution of X_data
@@ -140,6 +137,7 @@ def sample_training_batch(X_data, t_0, T, d, batch_size):
 
     Returns (tau, x_t, g), each a numpy array of shape (batch_size, ...).
     """
+
     N = X_data.shape[0]
 
     tau = np.random.uniform(t_0, T, size=(batch_size, 1))          # (B, 1), broadcasts over d
@@ -157,19 +155,16 @@ def sample_training_batch(X_data, t_0, T, d, batch_size):
 
 
 # ============================================================
-# Training: Adam-based (the standard optimiser used throughout
-# the dissertation for the neural network score estimator)
+# Training: Adam-based 
 # ============================================================
 
 def train_network(net, X_data, t_0, T, d, n_iters, batch_size, lr, device, print_every=500):
     """
-    Train a single ScoreNet or ScoreNet3 instance via denoising score
+    Train a single 2 or 3 layer NN using denoising score
     matching, using the Adam optimiser.
 
     This corresponds to minimising the tractable objective U~(theta) in
-    \eqref{eq:U_tilde}, using the stochastic gradient H(theta) in
-    \eqref{eq:stoch_grad} (computed here via autograd, not the hand-derived
-    backprop formulas, though they agree by construction).
+    \eqref{eq:U_tilde}, using the stochastic gradient H(theta) 
 
     Per Assumption 1 of Sabanis 2025, Adam is a valid choice of optimiser:
     the theory only requires the output theta_hat to satisfy an L^2
@@ -206,42 +201,33 @@ def train_network(net, X_data, t_0, T, d, n_iters, batch_size, lr, device, print
 
 
 # ============================================================
-# Training: SGLD-based (for direct comparison against Adam -
-# matches the recurrence used in the toy unknown-mean example,
-# but with H(theta) computed via backprop through the network
+# Training: SGLD-based computed via backprop through the network
 # rather than in closed form)
 # ============================================================
 
 def train_network_sgld(net, X_data, t_0, T, d, n_iters, batch_size,
-                        lam, beta, device, print_every=500):
+                        lam, beta, device, kappa_fn=None, print_every=500):
     """
     Train net via Stochastic Gradient Langevin Dynamics:
 
-        theta_{k+1} = theta_k - lam * H(theta_k) + sqrt(2*lam/beta) * xi_k,
-        xi_k ~ N(0, I_{d_theta})
+    theta_{k+1} = theta_k - lam * H(theta_k) + sqrt(2*lam/beta) * xi_k,
+    xi_k ~ N(0, I_{d_theta})
 
     matching Sabanis (2023) eq. (15) / theta_nplusone_func in the toy
     unknown-mean example, but with H(theta) now the gradient of the
     neural network loss (computed via backprop), not the closed-form
     Gaussian-mean gradient.
 
-    IMPORTANT: the loss here is summed over output dimensions and
-    averaged over the batch (NOT nn.MSELoss's default mean-over-everything),
-    to exactly match the scale of H(theta) as defined in the dissertation:
 
-        H(theta) = (1/|B|) sum_i grad_theta ||s_theta(x_t^i, tau^i) - g^i||^2
+    kappa_fn: optional callable tau -> weight, applied to the loss per
+    Sabanis's kappa(t) weighting in the objective. If None, kappa=1
+    (current default behaviour). Sabanis 2023's own numerical experiment
+    uses kappa(t) = sigma_t^2 = 1 - exp(-2t), which cancels the 1/sigma_tau
+    blow-up in the target g = -z/sigma_tau as tau -> 0 - pass
+    kappa_fn=lambda tau: 1 - np.exp(-2 * tau) to reproduce that choice.
 
-    Using a differently-scaled loss (e.g. dividing by d as well) would
-    silently change the drift-to-noise ratio relative to the intended
-    beta, since the injected noise sqrt(2*lam/beta) does not rescale
-    to match.
+        Returns (net, loss_history).
 
-    No optimizer object (Adam/SGD) is used - the parameter update is
-    applied manually with torch.no_grad(), so there is no adaptive
-    step-size or momentum: this is a plain fixed-step Langevin update,
-    as the theory requires.
-
-    Returns (net, loss_history).
     """
     net.to(device)
     loss_history = []
@@ -255,21 +241,17 @@ def train_network_sgld(net, X_data, t_0, T, d, n_iters, batch_size,
         g_t = torch.tensor(g_b, dtype=torch.float32, device=device)
 
         pred = net(x_t_t, tau_t)
-
-        # Sum over output dims (matches ||.||^2), mean over batch (matches 1/|B|).
-        # This is deliberately NOT nn.MSELoss(), which would additionally
-        # divide by d and change the effective noise scale below.
         per_sample_sq_error = ((pred - g_t) ** 2).sum(dim=1)
+
+        if kappa_fn is not None:
+            kappa_t = torch.tensor(kappa_fn(tau_b), dtype=torch.float32, device=device).squeeze(-1)
+            per_sample_sq_error = kappa_t * per_sample_sq_error
+
         loss = per_sample_sq_error.mean()
 
         net.zero_grad()
         loss.backward()
 
-        # Manual Langevin update: theta <- theta - lam * grad + sqrt(2*lam/beta) * noise.
-        # torch.randn_like(p) applied per-parameter-tensor is equivalent to drawing
-        # the full xi_k ~ N(0, I_{d_theta}) jointly, since a multivariate standard
-        # normal decomposes into i.i.d. standard normal entries regardless of how
-        # the coordinates are grouped into tensors (W_1, b_1, W_2, b_2, ...).
         with torch.no_grad():
             for p in net.parameters():
                 noise = torch.randn_like(p) * np.sqrt(2 * lam / beta)
@@ -281,7 +263,6 @@ def train_network_sgld(net, X_data, t_0, T, d, n_iters, batch_size,
             print(f"[SGLD] iter {it}/{n_iters}, loss = {loss.item():.4f}")
 
     return net, loss_history
-
 
 # ============================================================
 # Sampling from a trained network (reverse SDE, Euler-Maruyama)
