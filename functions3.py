@@ -105,6 +105,38 @@ class ScoreNet3(nn.Module):
         return a_3
 
 
+
+class ScoreNetDeep(nn.Module):
+    """
+    General L-hidden-layer score estimator s(t, theta, x), generalising
+    ScoreNet (1 hidden layer) and ScoreNet3 (2 hidden layers) to arbitrary depth.
+
+    hidden_dims: list of hidden layer widths, e.g. [128]*19 gives 19 hidden
+    layers + 1 output layer = 20 linear layers total (matching the
+    "N-layer" naming convention used for ScoreNet/ScoreNet3, where the
+    count includes the output layer).
+    """
+
+    def __init__(self, d, hidden_dims):
+        super().__init__()
+        D_0 = d + 1   # input dim: d spatial + 1 time
+        D_out = d     # output dim: matches data dimension
+
+        dims = [D_0] + list(hidden_dims) + [D_out]
+        self.layers = nn.ModuleList([
+            nn.Linear(dims[i], dims[i + 1]) for i in range(len(dims) - 1)
+        ])
+        self.activation = nn.Tanh()
+
+    def forward(self, x, t):
+        z = torch.cat([x, t], dim=1)
+        for layer in self.layers[:-1]:      # tanh on every hidden layer
+            z = self.activation(layer(z))
+        z = self.layers[-1](z)              # identity output activation
+        return z
+    
+    
+
 # ============================================================
 # Training data generation
 # ============================================================
