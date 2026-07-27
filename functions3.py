@@ -135,7 +135,7 @@ class ScoreNetDeep(nn.Module):
         z = self.layers[-1](z)              # identity output activation
         return z
     
-    
+
 
 # ============================================================
 # Training data generation
@@ -293,6 +293,99 @@ def train_network_sgld(net, X_data, t_0, T, d, n_iters, batch_size,
 
         if it % print_every == 0:
             print(f"[SGLD] iter {it}/{n_iters}, loss = {loss.item():.4f}")
+
+    return net, loss_history
+
+
+
+
+
+
+def train_network_theopoula(net, X_data, t_0, T, d, n_iters, batch_size,
+                             lam, eta, r, eps, beta, device,
+                             kappa_fn=None, print_every=500):
+    """
+    Train net via ThεO PouLa (eq. 2.5-2.6):
+
+    theta_{n+1} = theta_n - lam * H_{lam,c}(theta_n, X_{n+1})
+                          + sqrt(2*lam/beta) * xi_{n+1},   xi ~ N(0, I)
+
+    where, componentwise (i indexes individual scalar parameters):
+
+    H^{(i)}(theta,x) = [G^{(i)}(theta,x) / (1 + sqrt(lam)|G^{(i)}(theta,x)|)]
+                        * [1 + sqrt(lam) / (eps + |G^{(i)}(theta,x)|)]      (taming * boosting)
+                      + eta * theta^{(i)} * |theta|^{2r} / (1 + sqrt(lam)|theta|^{2r})  (regularisation)
+
+    G(theta,x) is the raw loss gradient (obtained via backprop, i.e. p.grad),
+    taming/boosting act elementwise on each individual gradient component,
+    and |theta| in the regularisation term is the Euclidean norm of the
+    ENTIRE parameter vector (all layers concatenated), matching Definition 1's
+    dissipativity term eta*theta*|theta|^{2r} used to guarantee stability.
+
+    Hyperparameters:
+        lam   : learning rate (lambda)
+        eta   : regularisation strength
+        r     : regularisation exponent (Definition 1 requires r >= q/2 + 1)
+        eps   : small constant in the boosting function denominator
+        beta  : inverse temperature (as in SGLD)
+
+    kappa_fn: optional callable tau -> weight, same convention as
+    train_network_sgld.
+
+    Returns (net, loss_history).
+    """
+    net.to(device)
+    loss_history = []
+    sqrt_lam = np.sqrt(lam)
+
+    net.train()
+    for it in range(1, n_iters + 1):
+        tau_b, x_t_b, g_b = sample_training_batch(X_data, t_0, T, d, batch_size)
+
+        tau_t = torch.tensor(tau_b, dtype=torch.float32, device=device)
+        x_t_t = torch.tensor(x_t_b, dtype=torch.float32, device=device)
+        g_t = torch.tensor(g_b, dtype=torch.float32, device=device)
+
+        pred = net(x_t_t, tau_t)
+        per_sample_sq_error = ((pred - g_t) ** 2).sum(dim=1)
+
+        if kappa_fn is not None:
+            kappa_t = torch.tensor(kappa_fn(tau_b), dtype=torch.float32, device=device).squeeze(-1)
+            per_sample_sq_error = kappa_t * per_sample_sq_error
+
+        loss = per_sample_sq_error.mean()
+
+        net.zero_grad()
+        loss.backward()
+
+        with torch.no_grad():
+            # |theta|: Euclidean norm of the FULL parameter vector,
+            # needed once per iteration for the regularisation term.
+            theta_sq_sum = sum((p ** 2).sum() for p in net.parameters())
+            theta_norm = torch.sqrt(theta_sq_sum)
+            theta_norm_2r = theta_norm ** (2 * r)
+
+            for p in net.parameters():
+                G = p.grad  # raw gradient, elementwise
+
+                # taming * boosting, applied elementwise to G
+                G_abs = G.abs()
+                tamed = G / (1 + sqrt_lam * G_abs)
+                boosted = tamed * (1 + sqrt_lam / (eps + G_abs))
+
+                # global dissipativity regularisation term
+                reg = eta * p * theta_norm_2r / (1 + sqrt_lam * theta_norm_2r)
+
+                H = boosted + reg
+
+                noise = torch.randn_like(p) * np.sqrt(2 * lam / beta)
+                p.add_(-lam * H + noise)
+
+        loss_history.append(loss.item())
+
+        if it % print_every == 0:
+            print(f"[TheoPouLa] iter {it}/{n_iters}, loss = {loss.item():.4f}, "
+                  f"|theta| = {theta_norm.item():.4f}")
 
     return net, loss_history
 
@@ -571,3 +664,39 @@ def train_network_tusla(net, X_data, t_0, T, d, n_iters, batch_size,
                   f"||theta|| = {theta_norm.item():.4f}")
 
     return net, loss_history, param_norm_history
+
+
+
+
+
+
+
+
+
+def compute_layerwise_grad_norms(net, X_data, t_0, T, d, batch_size, device):
+    """
+    Run a single forward+backward pass and return the gradient norm for
+    every named parameter tensor - lets you directly check for vanishing
+    gradients (a decaying pattern from output-side layers back to
+    input-side layers) rather than just inferring it from training behaviour.
+
+    Returns a dict {parameter_name: grad_norm}.
+    """
+    net.to(device)
+    net.train()
+    net.zero_grad()
+
+    tau_b, x_t_b, g_b = sample_training_batch(X_data, t_0, T, d, batch_size)
+    tau_t = torch.tensor(tau_b, dtype=torch.float32, device=device)
+    x_t_t = torch.tensor(x_t_b, dtype=torch.float32, device=device)
+    g_t = torch.tensor(g_b, dtype=torch.float32, device=device)
+
+    pred = net(x_t_t, tau_t)
+    loss = ((pred - g_t) ** 2).sum(dim=1).mean()
+    loss.backward()
+
+    grad_norms = {
+        name: (p.grad.norm().item() if p.grad is not None else None)
+        for name, p in net.named_parameters()
+    }
+    return grad_norms
