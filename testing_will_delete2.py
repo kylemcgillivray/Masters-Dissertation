@@ -35,28 +35,38 @@ import functions4 as fct
 # ==========================================================================
 
 OUT_DIR = "deleteoutputs"
-OUT_NAME = "itersweep"
+OUT_NAME = "itersweep_paper"      # <-- distinct, so the earlier run is kept
 
 # --- the configuration under test ---------------------------------------
 TARGET    = "bimodal"        # "bimodal" or "gaussian"
-ARCHS     = [2]              # <-- shallow net; was [20]
+ARCHS     = [2]              # r = 10 is admissible at L=2 (r_min = 1.5),
+                             # but NOT at L=20 (r_min = 19.5)
 OPTIMISER = "theopoula"      # stateless, so segmented training is exact
 WIDTH     = 128
 USE_SKIP  = False
 SEED      = 0
 
 # --- iteration checkpoints ----------------------------------------------
-# Log-spaced, because any remaining improvement will be slow and
-# multiplicative rather than linear. Trim the tail if you want it shorter.
 CHECKPOINTS = [500, 1_000, 2_000, 5_000, 10_000, 20_000,
                50_000, 100_000, 200_000, 500_000]
 
-# --- optimiser hyperparameters ------------------------------------------
-# NOTE: at L=2 the network operates near |theta| ~ 7.6, where the penalty
-# eta*|theta|^(2r+1) is about 1.8, i.e. comparable to the score-matching
-# gradient itself. Drag is present but not overwhelming as it was at L=20.
-PARAMS = dict(lam=0.02, beta=1e10, r=2.0, eps_b=0.2,
-              eta=5e-4 * np.sqrt(0.02))
+# --- optimiser hyperparameters: Lim & Sabanis (JMLR 2024) ----------------
+# lam    0.1        best learning rate for VGG11 and ResNet34 on CIFAR-10
+#                   (their Table 4); 0.05 was best for ResNet on CIFAR-100
+# eps_b  0.1        their best boosting parameter. Smaller exaggerates the
+#                   boosting effect, larger depresses it; they report 0.001
+#                   destabilised VGG, so that is the practical floor
+# beta   1e10       the value they fix in the eps and r studies
+# r      10         used in their Section 4.4, which exists to close the gap
+#                   between the theory (r >= q/2) and Section 4.2 (r = 0)
+# eta    5e-4*sqrt(lam)
+#                   chosen in Section 4.4 so that, once sqrt(lam)|theta|^{2r}
+#                   >> 1, the tamed penalty eta*theta*|theta|^{2r} /
+#                   (1 + sqrt(lam)|theta|^{2r}) reduces to eta*theta/sqrt(lam)
+#                   = 5e-4 * theta, i.e. plain l2 decay at 5e-4
+LAM = 0.1
+PARAMS = dict(lam=LAM, beta=1e10, r=10.0, eps_b=0.1,
+              eta=5e-4 * np.sqrt(LAM))
 
 # --- target geometry -----------------------------------------------------
 D       = 2
@@ -74,12 +84,12 @@ PRINT_EVERY = 5_000
 
 # --- evaluation at each checkpoint --------------------------------------
 N_W2         = 10_000
-N_REPEATS    = 2             # 2 gives a spread without doubling the cost
+N_REPEATS    = 2
 NUM_ITER_MAX = 100_000_000
 EM_BATCH     = 20_000
-SCORE_TS     = [0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0]   # unweighted score error
+SCORE_TS     = [0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0]
 N_MC_SCORE   = 20_000
-KEEP_SAMPLES_AT = [10_000, 100_000, 500_000]   # checkpoints whose samples are stored
+KEEP_SAMPLES_AT = [10_000, 100_000, 500_000]
 
 # --- floor, for context on the same axes --------------------------------
 FLOOR_REPEATS = 3
@@ -124,6 +134,8 @@ def main():
         n_params = sum(p.numel() for p in net.parameters())
         print(f"{n_params} parameters, q = {fct.q_of(arch):.0f}, "
               f"r_min = {fct.r_min(arch):.1f}, r used = {PARAMS['r']}")
+        print(f"lam = {PARAMS['lam']}, eps_b = {PARAMS['eps_b']}, "
+              f"beta = {PARAMS['beta']:.0e}, eta = {PARAMS['eta']:.3e}")
 
         record = dict(
             config=dict(tag=tag, target=TARGET, optimiser=OPTIMISER, arch=arch,
@@ -214,7 +226,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
